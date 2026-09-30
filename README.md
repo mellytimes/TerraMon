@@ -5,7 +5,7 @@ Little TUI I made to babysit my Terraria server on Proxmox. Auto-restarts it, fi
 ## Install
 
 ```bash
-wget -O terramon.py [https://gist.githubusercontent.com/mellytimes/c935fecff360201e7375775b8d377194/raw/terramon.py]
+wget -O terramon.py https://gist.githubusercontent.com/mellytimes/c935fecff360201e7375775b8d377194/raw/terramon.py
 ```
 
 ## Run
