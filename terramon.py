@@ -10,6 +10,8 @@ What it does
   * Downloads the latest vanilla dedicated server (terraria.org) or the latest
     tModLoader (GitHub) from inside the TUI - using wget, or Python if wget
     is missing.
+  * Downloads every mod in a Steam Workshop collection (via steamcmd, installed
+    automatically) into tModLoader's Mods folder and enables exactly those mods.
   * Shows public IP, DuckDNS IP, server status, version, uptime, RAM, CPU,
     network traffic, errors and the live server console log.
   * Auto-detects the vanilla server, tModLoader and DuckDNS folders.
@@ -52,7 +54,7 @@ from collections import deque
 from datetime import datetime
 
 APP_NAME = "TerraMon"
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 UA = f"{APP_NAME}/{APP_VERSION}"
 
 HOME = os.path.expanduser("~")
@@ -73,6 +75,11 @@ VANILLA_LIST_URL = "https://terraria.org/api/get/dedicated-servers-names"
 VANILLA_DL_URL = "https://terraria.org/api/download/pc-dedicated-server/{name}"
 TMOD_RELEASE_URL = "https://api.github.com/repos/tModLoader/tModLoader/releases/latest"
 TMOD_LATEST_DL = "https://github.com/tModLoader/tModLoader/releases/latest/download/tModLoader.zip"
+TMOD_APP_ID = "1281930"   # tModLoader's Steam app id (its Workshop)
+STEAM_COLLECTION_API = "https://api.steampowered.com/ISteamRemoteStorage/GetCollectionDetails/v1/"
+STEAM_DETAILS_API = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/"
+STEAMCMD_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz"
+DEFAULT_MODS_DIR = os.path.join(HOME, ".local", "share", "Terraria", "tModLoader", "Mods")
 PUBLIC_IP_URLS = [
     "https://api.ipify.org",
     "https://ipv4.icanhazip.com",
@@ -95,6 +102,8 @@ DEFAULTS = {
     "auto_restart": True,
     "auto_duckdns": True,
     "use_wget": True,
+    "tmod_mods_dir": "",            # empty = ~/.local/share/Terraria/tModLoader/Mods
+    "workshop_collection": "",      # last Workshop collection used
     "check_interval": 2,            # seconds between server checks
     "ip_check_interval": 60,        # seconds between public IP / DuckDNS checks
     "startup_grace": 240,           # seconds a start may take before we complain
@@ -213,6 +222,97 @@ def github_latest_via_redirect(url):
         raise RuntimeError("could not find the latest tModLoader release on GitHub")
     return urllib.parse.unquote(m.group(1)), loc
 
+
+def http_post_form(url, fields, timeout=20):
+    data = urllib.parse.urlencode(fields).encode()
+    req = urllib.request.Request(url, data=data, headers={
+        "User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read(10_000_000).decode("utf-8", "replace")
+
+
+def parse_workshop_id(text):
+    """Accept a Workshop/collection URL or a plain id."""
+    text = (text or "").strip()
+    m = re.search(r"[?&]id=(\d{5,})", text)
+    if m:
+        return m.group(1)
+    return text if re.fullmatch(r"\d{5,}", text) else None
+
+
+def steam_collection_items(cid, depth=0):
+    """Return the item ids inside a collection (nested collections included),
+    or None if cid is not a collection."""
+    j = json.loads(http_post_form(STEAM_COLLECTION_API,
+                                  {"collectioncount": 1, "publishedfileids[0]": cid}))
+    det = (j.get("response") or {}).get("collectiondetails") or []
+    if not det or det[0].get("result") != 1 or not det[0].get("children"):
+        return None
+    items = []
+    for ch in sorted(det[0]["children"], key=lambda c: c.get("sortorder", 0)):
+        fid = str(ch.get("publishedfileid", ""))
+        if not fid.isdigit():
+            continue
+        if ch.get("filetype") == 2:
+            if depth < 2:
+                items += steam_collection_items(fid, depth + 1) or []
+        else:
+            items.append(fid)
+    return list(dict.fromkeys(items))
+
+
+def steam_item_details(ids):
+    out = {}
+    for i in range(0, len(ids), 100):
+        chunk = ids[i:i + 100]
+        fields = {"itemcount": len(chunk)}
+        for n, x in enumerate(chunk):
+            fields[f"publishedfileids[{n}]"] = x
+        j = json.loads(http_post_form(STEAM_DETAILS_API, fields))
+        for d in (j.get("response") or {}).get("publishedfiledetails") or []:
+            fid = str(d.get("publishedfileid", ""))
+            out[fid] = {"title": d.get("title") or fid, "ok": d.get("result") == 1,
+                        "app": str(d.get("consumer_app_id", ""))}
+    return out
+
+
+def pick_tmod_file(item_dir, tml_version):
+    """Workshop items hold one .tmod per tModLoader version (folders like '2025.6').
+    Pick the newest one that is not newer than the installed tModLoader."""
+    cands = []
+    try:
+        entries = os.listdir(item_dir)
+    except OSError:
+        return None
+    for entry in entries:
+        p = os.path.join(item_dir, entry)
+        if os.path.isdir(p) and re.fullmatch(r"\d{4}\.\d+", entry):
+            tm = sorted(f for f in os.listdir(p) if f.endswith(".tmod"))
+            if tm:
+                cands.append((version_tuple(entry), os.path.join(p, tm[0])))
+        elif entry.endswith(".tmod") and os.path.isfile(p):
+            cands.append(((0,), p))
+    if not cands:
+        return None
+    if tml_version:
+        fitting = [c for c in cands if c[0] <= tml_version]
+        if fitting:
+            return max(fitting)[1]
+    return max(cands)[1]
+
+
+def mods_dir_for(cfg):
+    d = (cfg["tmod_mods_dir"] or "").strip()
+    return os.path.expanduser(d) if d else DEFAULT_MODS_DIR
+
+
+def read_enabled_mods(mods_dir):
+    try:
+        with open(os.path.join(mods_dir, "enabled.json")) as f:
+            data = json.load(f)
+        return [x for x in data if isinstance(x, str)] if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return None
 
 def safe_getsize(p):
     try:
@@ -653,7 +753,7 @@ class Downloader:
         if self._cancel:
             raise Cancelled()
 
-    def start(self, kind):
+    def start(self, kind, arg=None):
         with self.lock:
             if self.busy:
                 self.mon.log("WARN", "A download is already running - press C to cancel it first.")
@@ -662,7 +762,7 @@ class Downloader:
             self.got, self.total, self.method = 0, None, None
             self.started, self.finished, self.result = time.time(), None, None
             self._cancel = False
-        threading.Thread(target=self._run, args=(kind,), daemon=True).start()
+        threading.Thread(target=self._run, args=(kind, arg), daemon=True).start()
 
     def cancel(self):
         with self.lock:
@@ -677,13 +777,16 @@ class Downloader:
             except OSError:
                 pass
 
-    def _run(self, kind):
-        label = "Vanilla server" if kind == "vanilla" else "tModLoader"
-        self.mon.log("INFO", f"Downloading latest {label}...")
+    def _run(self, kind, arg=None):
+        label = {"vanilla": "Vanilla server", "tmodloader": "tModLoader",
+                 "workshop": "Workshop mods"}.get(kind, kind)
+        self.mon.log("INFO", f"Downloading {label}..." if kind == "workshop" else f"Downloading latest {label}...")
         result = "error"
         try:
             if kind == "vanilla":
                 self._install_vanilla()
+            elif kind == "workshop":
+                self._install_workshop(arg)
             else:
                 self._install_tmod()
             result = "done"
@@ -758,6 +861,168 @@ class Downloader:
                     make_executable(os.path.join(dp, fn))
         write_marker(d, tag)
         self.mon.on_installed("tmodloader", d, tag)
+
+    # ---- Steam Workshop collections
+    def _install_workshop(self, wid):
+        cfg = self.mon.cfg
+        if not wid:
+            raise RuntimeError("no Workshop collection id given")
+        if not valid_tmod(cfg["tmod_dir"]):
+            raise RuntimeError("install tModLoader first (D then 2) - Workshop mods need it")
+        self._set(phase="reading collection")
+        ids = steam_collection_items(wid)
+        single = ids is None
+        if single:
+            ids = [wid]          # not a collection - maybe a single mod
+        details = steam_item_details(ids)
+        good, skipped = [], []
+        for i in ids:
+            d = details.get(i)
+            if d and d["ok"] and d["app"] == TMOD_APP_ID:
+                good.append(i)
+            else:
+                skipped.append((d or {}).get("title", i))
+        if not good:
+            raise RuntimeError("no tModLoader mods found - is the collection public and for tModLoader?")
+        if skipped:
+            self.mon.log("WARN", f"Skipping {len(skipped)} item(s) that are not tModLoader mods or are "
+                                 f"private/removed: {', '.join(skipped[:5])}{'...' if len(skipped) > 5 else ''}")
+        what = "mod" if single else f"collection with {len(good)} mods"
+        self.mon.log("INFO", f"Workshop {what}: {details[good[0]]['title'] if single else wid}")
+
+        sh = self._ensure_steamcmd()
+        root = os.path.join(DOWNLOAD_ROOT, "workshop")
+        os.makedirs(root, exist_ok=True)
+        self._set(phase="downloading mods", method="steamcmd", total=len(good), got=0)
+        done = self._steamcmd_download(sh, root, good)
+        failed = [i for i in good if i not in done]
+
+        self._set(phase="installing mods")
+        content = os.path.join(root, "steamapps", "workshop", "content", TMOD_APP_ID)
+        tml = version_tuple(detect_version("tmodloader", cfg["tmod_dir"]))[:2] or None
+        mods_dir = mods_dir_for(cfg)
+        os.makedirs(mods_dir, exist_ok=True)
+        names = []
+        for i in good:
+            if i not in done:
+                continue
+            f = pick_tmod_file(os.path.join(content, i), tml)
+            if not f:
+                failed.append(i)
+                self.mon.log("WARN", f"No .tmod file for '{details[i]['title']}' fits this tModLoader version.")
+                continue
+            name = os.path.splitext(os.path.basename(f))[0]
+            dest = os.path.join(mods_dir, name + ".tmod")
+            tmp = dest + ".terramon-tmp"
+            shutil.copyfile(f, tmp)
+            os.replace(tmp, dest)
+            names.append(name)
+        if not names:
+            raise RuntimeError("none of the mods could be installed")
+
+        enabled = os.path.join(mods_dir, "enabled.json")
+        old = read_enabled_mods(mods_dir)
+        if single and old:
+            names = list(dict.fromkeys(old + names))     # a single mod is added to the list
+        elif os.path.isfile(enabled):
+            shutil.copyfile(enabled, enabled + ".bak")
+        tmp = enabled + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(sorted(set(names)), fh, indent=2)
+        os.replace(tmp, enabled)
+        if not single:
+            cfg["workshop_collection"] = wid
+            self.mon._save_cfg()
+        if failed:
+            titles = [details.get(i, {}).get("title", i) for i in dict.fromkeys(failed)]
+            self.mon.log("ERROR", f"{len(titles)} mod(s) failed: {', '.join(titles[:6])}"
+                                  f"{'...' if len(titles) > 6 else ''}. Press D, 3 to retry.")
+        self.mon.on_mods_installed(len(names), mods_dir)
+
+    def _ensure_steamcmd(self):
+        local = os.path.join(HOME, "steamcmd", "steamcmd.sh")
+        if os.path.isfile(local):
+            return local
+        for c in ("steamcmd", "/usr/games/steamcmd"):
+            found = shutil.which(c)
+            if found:
+                return found
+        self.mon.log("INFO", "steamcmd not found - downloading it (one time only)...")
+        d = os.path.dirname(local)
+        os.makedirs(d, exist_ok=True)
+        part = os.path.join(d, "steamcmd_linux.tar.gz.part")
+        self._fetch(STEAMCMD_URL, part)
+        self._set(phase="extracting steamcmd")
+        import tarfile
+        try:
+            with tarfile.open(part) as t:
+                real = os.path.realpath(d)
+                for m in t.getmembers():
+                    target = os.path.realpath(os.path.join(d, m.name))
+                    if not (target == real or target.startswith(real + os.sep)) or m.issym() or m.islnk():
+                        raise RuntimeError(f"unsafe path in steamcmd archive: {m.name}")
+                t.extractall(d)
+        finally:
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+        if not os.path.isfile(local):
+            raise RuntimeError("steamcmd archive did not contain steamcmd.sh")
+        make_executable(local)
+        lin = os.path.join(d, "linux32", "steamcmd")
+        if os.path.isfile(lin):
+            make_executable(lin)
+        return local
+
+    def _steamcmd_download(self, sh, root, ids):
+        done = set()
+        pending = list(ids)
+        for attempt in range(3):
+            if not pending:
+                break
+            if attempt:
+                self.mon.log("WARN", f"{len(pending)} mod(s) failed to download - retrying "
+                                     f"(attempt {attempt + 1}/3)...")
+            for b in range(0, len(pending), 15):
+                batch = pending[b:b + 15]
+                args = [sh, "+force_install_dir", root, "+login", "anonymous"]
+                for i in batch:
+                    args += ["+workshop_download_item", TMOD_APP_ID, i]
+                args.append("+quit")
+                tail = deque(maxlen=8)
+                with self.lock:
+                    self._check_cancel()
+                    p = subprocess.Popen(args, cwd=os.path.dirname(sh), stdin=subprocess.DEVNULL,
+                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                         text=True, errors="replace", bufsize=1)
+                    self._proc = p
+                watchdog = threading.Timer(1800, p.kill)   # never hang forever
+                watchdog.daemon = True
+                watchdog.start()
+                try:
+                    for line in p.stdout:
+                        line = line.strip()
+                        if line:
+                            tail.append(line)
+                        m = re.search(r"Success\. Downloaded item (\d+)", line)
+                        if m and m.group(1) in batch:
+                            done.add(m.group(1))
+                            self._set(got=len(done))
+                        if "error while loading shared libraries" in line:
+                            p.kill()
+                            raise RuntimeError("steamcmd needs 32-bit libraries. As root run: "
+                                               "apt install -y lib32gcc-s1  (then press D, 3 again)")
+                    p.wait()
+                finally:
+                    watchdog.cancel()
+                self._check_cancel()
+                if not any(i in done for i in batch) and p.returncode not in (0, None):
+                    last = " | ".join(list(tail)[-2:])
+                    self.mon.log("WARN", f"steamcmd exited with code {p.returncode}: {last[:200]}",
+                                 key="steamcmd-exit", every=30)
+            pending = [i for i in pending if i not in done]
+        return done
 
     def _fetch(self, url, part, total_hint=None):
         os.makedirs(os.path.dirname(part), exist_ok=True)
@@ -1118,6 +1383,16 @@ class Monitor:
         err = self.cfg.save()
         if err:
             self.log("ERROR", f"Could not save config: {err}")
+
+    def on_mods_installed(self, count, mods_dir):
+        self.log("INFO", f"Installed and enabled {count} mod(s) in {mods_dir}")
+        with self.lock:
+            running = self.s["pid"] is not None
+        if self.resolve_kind() != "tmodloader":
+            self.log("INFO", "Mods only load in tModLoader - press T to switch the server type.")
+        elif running:
+            self.log("INFO", "Press X to restart the server so it loads the mods.")
+        self.server_wake.set()
 
     def on_installed(self, kind, d, version):
         key = "tmod_dir" if kind == "tmodloader" else "vanilla_dir"
@@ -1498,6 +1773,7 @@ class UI:
         self.mon = mon
         self.scr = None
         self.mode = "main"
+        self.input_buf = ""
         self.ascii = "utf" not in (locale.getpreferredencoding(False) or "").lower()
         self.C = {}
 
@@ -1646,6 +1922,12 @@ class UI:
         conf = cfg["tmod_serverconfig"] if kind == "tmodloader" else cfg["vanilla_serverconfig"]
         y = self.row(y, [("Config     : ", 0),
                          (conf, 0) if conf and os.path.isfile(conf) else ("not found", C["warn"])])
+        if kind == "tmodloader" or valid_tmod(td):
+            md = mods_dir_for(cfg)
+            en = read_enabled_mods(md)
+            y = self.row(y, [("Mods       : ", 0),
+                             (f"{len(en)} enabled" if en else "none enabled - press D, 3", C["info"] if en else C["warn"]),
+                             (f"   {md}", C["dim"])])
         ds = cfg["duckdns_script"]
         y = self.row(y, [("DuckDNS    : ", 0),
                          (ds, 0) if ds else (("set in config.json", 0) if dom else ("not found", C["warn"]))])
@@ -1680,8 +1962,17 @@ class UI:
 
     def _draw_download(self, y, dl, w):
         C = self.C
-        what = "tModLoader" if dl["kind"] == "tmodloader" else "Vanilla server"
+        what = {"tmodloader": "tModLoader", "workshop": "Workshop mods"}.get(dl["kind"], "Vanilla server")
         got, total = dl["got"], dl["total"]
+        if dl["method"] == "steamcmd" and dl["phase"] in ("downloading mods", "installing mods", "done",
+                                                          "error", "cancelled"):
+            frac = (got / total) if total else 0
+            barw = max(10, min(40, w - 60))
+            fill = int(barw * frac)
+            col = {"done": C["ok"], "error": C["bad"], "cancelled": C["warn"]}.get(dl["phase"], C["info"])
+            y = self.row(y, [(f"{what}: ", 0), (dl["phase"], col | curses.A_BOLD), ("   via steamcmd", C["dim"])])
+            return self.row(y, [("[" + "#" * fill + "." * (barw - fill) + "]", C["info"]),
+                                (f" {got} / {total or '?'} mods", 0)])
         el = max(0.001, (dl["finished"] or time.time()) - (dl["started"] or time.time()))
         speed = got / el if got else 0
         if total:
@@ -1702,10 +1993,21 @@ class UI:
         if self.mode == "download":
             lines = ["Download a server (latest version)", "",
                      "1  Vanilla Terraria dedicated server (terraria.org)",
-                     "2  tModLoader server (GitHub)", "",
+                     "2  tModLoader server (GitHub)",
+                     "3  Mods from a Steam Workshop collection (tModLoader)", "",
                      f"Installs into {DOWNLOAD_ROOT}/  using " +
                      ("wget" if S["cfg"]["use_wget"] and shutil.which("wget") else "Python"),
                      "", "Esc  cancel"]
+        elif self.mode == "workshop_input":
+            last = S["cfg"]["workshop_collection"]
+            lines = ["Steam Workshop collection -> tModLoader mods", "",
+                     "Paste the collection link or its ID, then press Enter:", "",
+                     "> " + self.input_buf[-60:] + "_", "",
+                     "Downloads every mod with steamcmd, copies them into the",
+                     "Mods folder and enables exactly those mods.",
+                     "A single mod link/ID also works (it is added to the list).",
+                     (f"Enter on empty = reuse last: {last}" if last else ""),
+                     "Esc  cancel"]
         elif self.mode == "confirm_stop":
             lines = ["Stop the server?", "", "It will save the world and close.",
                      "Auto-restart will NOT start it again until you press S.", "", "Y  yes     N  no"]
@@ -1719,7 +2021,7 @@ class UI:
             lines = ["TerraMon help", "",
                      "S  start / stop the server (stop = sends 'exit', world is saved)",
                      "X  restart the server (e.g. after downloading a new version)",
-                     "D  download latest Vanilla or tModLoader server",
+                     "D  download Vanilla / tModLoader server, or Workshop collection mods",
                      "C  cancel the running download",
                      "U  force a DuckDNS update now",
                      "A  toggle auto-restart (starts server whenever it is down)",
@@ -1744,12 +2046,31 @@ class UI:
         except ValueError:
             key = ""
         m = self.mon
+        if self.mode == "workshop_input":
+            if ch == 27:
+                self.mode = "main"
+            elif ch in (10, 13, curses.KEY_ENTER):
+                text = self.input_buf.strip() or m.cfg["workshop_collection"]
+                wid = parse_workshop_id(text)
+                self.mode = "main"
+                if wid:
+                    m.downloader.start("workshop", wid)
+                else:
+                    m.log("ERROR", "That is not a Workshop link or ID (looks like ...?id=1234567890).")
+            elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                self.input_buf = self.input_buf[:-1]
+            elif 32 <= ch < 127 and len(self.input_buf) < 300:
+                self.input_buf += chr(ch)
+            return None
         if self.mode == "download":
             self.mode = "main"
             if key == "1":
                 m.downloader.start("vanilla")
             elif key == "2":
                 m.downloader.start("tmodloader")
+            elif key == "3":
+                self.input_buf = ""
+                self.mode = "workshop_input"
             return None
         if self.mode in ("confirm_stop", "confirm_restart", "confirm_quit"):
             mode, self.mode = self.mode, "main"
