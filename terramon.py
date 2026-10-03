@@ -54,7 +54,7 @@ from collections import deque
 from datetime import datetime
 
 APP_NAME = "TerraMon"
-APP_VERSION = "1.1"
+APP_VERSION = "1.2"
 UA = f"{APP_NAME}/{APP_VERSION}"
 
 HOME = os.path.expanduser("~")
@@ -660,7 +660,31 @@ class Config:
         self.lock = threading.RLock()
         self.data = json.loads(json.dumps(DEFAULTS))
         self.load_error = None
+        self.base = json.loads(json.dumps(self.data))
         self.load()
+
+    def _read_valid(self):
+        """Read config.json and return only valid known keys (or raise)."""
+        with open(CONF_PATH) as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            raise ValueError("config is not a JSON object")
+        out = {}
+        for k, v in raw.items():
+            if k in DEFAULTS and self._valid(k, v):
+                out[k] = v
+        return out
+
+    @staticmethod
+    def _valid(k, v):
+        d = DEFAULTS[k]
+        if isinstance(d, bool):
+            return isinstance(v, bool)
+        if isinstance(d, (int, float)):
+            return isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0
+        if isinstance(d, list):
+            return isinstance(v, list) and all(isinstance(x, str) for x in v)
+        return isinstance(v, str)
 
     def load(self):
         try:
@@ -682,6 +706,7 @@ class Config:
                     ok = isinstance(v, str)
                 if ok:
                     self.data[k] = v
+            self.base = json.loads(json.dumps(self.data))
         except FileNotFoundError:
             pass
         except Exception as e:
@@ -693,6 +718,15 @@ class Config:
 
     def save(self):
         with self.lock:
+            # Keep edits made by hand in config.json while TerraMon was running:
+            # a key that changed on disk but not in memory takes the disk value.
+            try:
+                disk = self._read_valid()
+                for k, v in disk.items():
+                    if v != self.base.get(k) and self.data.get(k) == self.base.get(k):
+                        self.data[k] = v
+            except (OSError, ValueError):
+                pass
             try:
                 os.makedirs(CONF_DIR, exist_ok=True)
                 tmp = CONF_PATH + ".tmp"
@@ -700,6 +734,7 @@ class Config:
                     json.dump(self.data, f, indent=2)
                 os.chmod(tmp, 0o600)  # holds the DuckDNS token
                 os.replace(tmp, CONF_PATH)
+                self.base = json.loads(json.dumps(self.data))
                 return None
             except OSError as e:
                 return str(e)
@@ -1301,6 +1336,17 @@ class Monitor:
             return "tmodloader"
         return "vanilla"
 
+    def configured_kind(self):
+        """The type the user selected (used for the NEXT start), ignoring what runs now."""
+        a = self.cfg["active_server"]
+        if a in ("vanilla", "tmodloader"):
+            return a
+        if valid_vanilla(self.cfg["vanilla_dir"]):
+            return "vanilla"
+        if valid_tmod(self.cfg["tmod_dir"]):
+            return "tmodloader"
+        return "vanilla"
+
     def kind_paths(self, kind):
         if kind == "tmodloader":
             return self.cfg["tmod_dir"], self.cfg["tmod_serverconfig"]
@@ -1364,13 +1410,19 @@ class Monitor:
         self.server_wake.set()
 
     def toggle_kind(self):
-        new = "tmodloader" if self.resolve_kind() == "vanilla" else "vanilla"
+        new = "tmodloader" if self.configured_kind() == "vanilla" else "vanilla"
         self.cfg["active_server"] = new
         self._save_cfg()
         name = "tModLoader" if new == "tmodloader" else "Vanilla"
         with self.lock:
             running = self.s["pid"] is not None
-        self.log("INFO", f"Server type set to {name}." + (" Press X to restart onto it." if running else ""))
+        with self.lock:
+            running_kind = self.s["proc_kind"]
+        if running and running_kind != new:
+            self.log("INFO", f"Server type set to {name}. The current server keeps running - "
+                             f"press X to restart onto {name}.")
+        else:
+            self.log("INFO", f"Server type set to {name}.")
         self.server_wake.set()
 
     def force_duck_update(self):
@@ -1388,7 +1440,7 @@ class Monitor:
         self.log("INFO", f"Installed and enabled {count} mod(s) in {mods_dir}")
         with self.lock:
             running = self.s["pid"] is not None
-        if self.resolve_kind() != "tmodloader":
+        if self.configured_kind() != "tmodloader":
             self.log("INFO", "Mods only load in tModLoader - press T to switch the server type.")
         elif running:
             self.log("INFO", "Press X to restart the server so it loads the mods.")
@@ -1402,7 +1454,7 @@ class Monitor:
         self.log("INFO", f"{name} {version} ready at {d}")
         with self.lock:
             running = self.s["pid"] is not None
-        if self.resolve_kind() != kind:
+        if self.configured_kind() != kind:
             self.log("INFO", f"Press T to switch the server type to {name}.")
         elif running:
             self.log("INFO", "Press X to restart the server on the new version.")
@@ -1495,7 +1547,7 @@ class Monitor:
         pid, kind = find_server_process()
         session = self.cfg["screen_session"]
         screen_alive = screen_session_exists(session)
-        active = kind or self.resolve_kind()
+        active = kind or self.configured_kind()
         port = self.current_port(active)
         listening = port_listening(port)
 
@@ -1741,6 +1793,7 @@ class Monitor:
         s["dl"] = self.downloader.snapshot()
         s["cfg"] = self.cfg.copy()
         s["kind"] = self.resolve_kind()
+        s["next_kind"] = self.configured_kind()
         return s
 
 
@@ -1874,7 +1927,11 @@ class UI:
         state = S["state"]
         scol = {"ONLINE": C["ok"], "STARTING": C["warn"], "STOPPING": C["warn"],
                 "OFFLINE": C["bad"]}.get(state, C["warn"]) | curses.A_BOLD
+        nk = S["next_kind"]
+        switch = (S["pid"] is not None and nk != kind)
         y = self.row(y, [("Status : ", 0), (f"[ {state} ]", scol), ("   Type: ", 0), (kname, C["info"]),
+                         ((f" -> {'tModLoader' if nk == 'tmodloader' else 'Vanilla'} after restart (X)"
+                           if switch else ""), C["warn"] | curses.A_BOLD),
                          ("   Version: ", 0), (S["version"] or "unknown", C["info"])])
         port = S["port"]
         y = self.row(y, [("World  : ", 0), (S["world"] or "-", C["info"]),
@@ -1919,7 +1976,7 @@ class UI:
         vd, td = cfg["vanilla_dir"], cfg["tmod_dir"]
         y = self.row(y, [("Vanilla    : ", 0), (vd, 0) if valid_vanilla(vd) else ("not found - press D", C["warn"])])
         y = self.row(y, [("tModLoader : ", 0), (td, 0) if valid_tmod(td) else ("not found - press D", C["warn"])])
-        conf = cfg["tmod_serverconfig"] if kind == "tmodloader" else cfg["vanilla_serverconfig"]
+        conf = cfg["tmod_serverconfig"] if S["next_kind"] == "tmodloader" else cfg["vanilla_serverconfig"]
         y = self.row(y, [("Config     : ", 0),
                          (conf, 0) if conf and os.path.isfile(conf) else ("not found", C["warn"])])
         if kind == "tmodloader" or valid_tmod(td):
